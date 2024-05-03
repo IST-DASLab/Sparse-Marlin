@@ -4,6 +4,7 @@
 
 import torch
 
+
 # This is PyTorch implementation of main part of reorder_meta()
 # function, from tools/util/include/cutlass/util/host_reorder.h file
 # of CUTLASS source tree.  Furthermore, CUTLASS template for sparse
@@ -24,7 +25,6 @@ def _calculate_meta_reordering_scatter_offsets(m, meta_ncols, meta_dtype, device
     # Reorder the rows, then swizzle the 2x2 blocks.
     group_x = 64
     group_y = 32 if meta_dtype.itemsize == 2 else 16
-    interweave = 4 if meta_dtype.itemsize == 2 else 2
 
     dst_rows = (
         dst_rows // group_x * group_x
@@ -273,7 +273,7 @@ def sparse_semi_structured_to_dense_cutlass(sparse, meta_reordered):
 
     dense = torch.zeros((m * 2 * k,), dtype=sparse.dtype, device=device)
     if sparse.dtype != torch.float:
-        #dense.scatter_(0, dense_offsets, sparse.view(-1))
+        # dense.scatter_(0, dense_offsets, sparse.view(-1))
         dense.scatter_(0, dense_offsets, sparse.reshape(-1))
     else:
         dense.view(torch.half).scatter_(
@@ -281,6 +281,7 @@ def sparse_semi_structured_to_dense_cutlass(sparse, meta_reordered):
         )
 
     return dense.view(m, 2 * k)
+
 
 def mask_creator(tensor):
     """
@@ -294,17 +295,13 @@ def mask_creator(tensor):
     N = 2
     M = 4
 
-    nm_sparsity = 1 - (N / M)
-    #target = nm_sparsity
-
     mask = None
-    #for i, tensor in enumerate(tensors):
+    # for i, tensor in enumerate(tensors):
     if tensor.numel() % M != 0:
         raise ValueError(
-            f"Tensor of size {tensor.shape} can't be evenly divided into "
-            f"{M} groups"
+            f"Tensor of size {tensor.shape} can't be evenly divided into " f"{M} groups"
         )
-    original_tensor = tensor.clone()
+
     num_groups = tensor.numel() // M
 
     # N:M sparsity for linear layers
@@ -315,6 +312,3 @@ def mask_creator(tensor):
     mask = w_b.scatter_(dim=1, index=index, value=0).reshape(tensor.shape)
 
     return mask
-
-
-
