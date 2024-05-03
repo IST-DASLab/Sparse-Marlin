@@ -24,8 +24,8 @@ namespace marlin {
 
 int marlin_cuda_2_4(const void *A, const void *B, const void *meta, void *C,
                     void *s, int prob_m, int prob_n, int prob_k,
-                    void *workspace, int groupsize = -1, int dev = 0,
-                    cudaStream_t stream = 0, int thread_k = -1,
+                    void *workspace, int num_bits, int groupsize = -1,
+                    int dev = 0, cudaStream_t stream = 0, int thread_k = -1,
                     int thread_m = -1, int sms = -1, int max_par = 16);
 
 int marlin_cuda(const void *A, const void *B, void *C, void *s, int prob_m,
@@ -65,13 +65,18 @@ void mul(const torch::Tensor &A, const torch::Tensor &B, torch::Tensor &C,
 
 void mul_2_4(const torch::Tensor &A, const torch::Tensor &B,
              const torch::Tensor &meta, torch::Tensor &C,
-             const torch::Tensor &s, torch::Tensor &workspace,
+             const torch::Tensor &s, torch::Tensor &workspace, int num_bits,
              int thread_k = -1, int thread_m = -1, int sms = -1,
              int max_par = 8) {
   int prob_n = A.size(0);
   int prob_m = C.size(1);
   int prob_k = A.size(1);
   int groupsize = (s.size(0) == 1) ? -1 : prob_k / 2 / s.size(0);
+  
+  if (num_bits != 4 && num_bits != 8) {
+    AT_ERROR("num_bits=", num_bits);
+  }
+  
   // printf("groupsize is:%d\n", groupsize);
   if (groupsize != -1 && groupsize * s.size(0) != (prob_k / 2))
     AT_ERROR("k=", prob_k, " not compatible with ", s.size(0), " groups.");
@@ -81,7 +86,7 @@ void mul_2_4(const torch::Tensor &A, const torch::Tensor &B,
   int dev = A.get_device();
   int err = marlin_cuda_2_4(
       A.data_ptr(), B.data_ptr(), meta.data_ptr(), C.data_ptr(), s.data_ptr(),
-      prob_m, prob_n, prob_k, workspace.data_ptr(), groupsize, dev,
+      prob_m, prob_n, prob_k, workspace.data_ptr(), num_bits, groupsize, dev,
       at::cuda::getCurrentCUDAStream(dev), thread_k, thread_m, sms, max_par);
   if (err == ERR_PROB_SHAPE) {
     AT_ERROR("Problem (m=", prob_m, ", n=", prob_n, ", k=", prob_k, ")",

@@ -19,8 +19,11 @@ DEV = torch.device("cuda:0")
 torch.set_printoptions(sci_mode=False, profile="full")
 
 
-def gen_quant4_NT(m, k, groupsize=-1):
-    maxq = 2**4 - 1
+def gen_quant4_NT(m, k, num_bits, groupsize=-1):
+    assert num_bits == 4 or num_bits == 8
+    pack_factor = 32 // num_bits
+
+    maxq = (1 << num_bits) - 1
     w = torch.randn((m, k), dtype=torch.half, device=DEV)
     k_sp = k // 2
 
@@ -59,10 +62,12 @@ def gen_quant4_NT(m, k, groupsize=-1):
     layer.k = k
     layer.n = m
     layer.groupsize = groupsize
-    layer.B = torch.empty((k_sp // 16, m * 16 // 8), dtype=torch.int, device=DEV)
+    layer.B = torch.empty(
+        (k_sp // 16, m * 16 // pack_factor), dtype=torch.int, device=DEV
+    )
     layer.meta = torch.empty((m, k // 16), dtype=torch.int16, device=DEV)
     layer.s = torch.empty((k_sp // (groupsize // 2), m), dtype=torch.half, device=DEV)
-    layer.pack(linear, s, True)
+    layer.pack(linear, s, num_bits, True)
     q = layer.B
     s = layer.s
     meta = layer.meta
@@ -70,18 +75,23 @@ def gen_quant4_NT(m, k, groupsize=-1):
     return uncompress, q, s, meta
 
 
+NUM_BITS = [4, 8]
+
+
 class Test(unittest.TestCase):
-    def run_problem(self, m, n, k, thread_k, thread_m, groupsize=-1):
+    def run_problem(self, num_bits, m, n, k, thread_k, thread_m, groupsize=-1):
         print(
-            "% 5d % 6d % 6d % 4d % 4d % 4d" % (m, n, k, thread_k, thread_m, groupsize)
+            "MNK = [{}, {}, {}] thread_k/m = [{}, {}] groupsize = {} num_bits = {}".format(
+                m, n, k, thread_k, thread_m, groupsize, num_bits
+            )
         )
         A = torch.randn((n, k), dtype=torch.half, device=DEV)
-        B_ref, B, s, meta = gen_quant4_NT(m, k, groupsize=groupsize)
+        B_ref, B, s, meta = gen_quant4_NT(m, k, num_bits, groupsize=groupsize)
         C = torch.zeros((n, m), dtype=torch.half, device=DEV)
         C_ref = torch.matmul(A, B_ref)
 
         workspace = torch.zeros(m // 128 * 16, device=DEV, dtype=torch.int32)
-        marlin.mul_2_4(A, B, meta, C, s, workspace, thread_k, thread_m, -1)
+        marlin.mul_2_4(A, B, meta, C, s, workspace, num_bits, thread_k, thread_m, -1)
         torch.cuda.synchronize()
 
         self.assertLess(
@@ -89,8 +99,9 @@ class Test(unittest.TestCase):
         )
 
     def test_correctness(self):
-        self.run_problem(256, 16, 256, 128, 128, -1)
-        self.run_problem(21504, 16, 4096, 64, 256, 128)
+        for num_bits in NUM_BITS:
+            self.run_problem(num_bits, 256, 16, 256, 128, 128, -1)
+            self.run_problem(num_bits, 21504, 16, 4096, 64, 256, 128)
 
     def test_tiles(self):
         print()
@@ -98,21 +109,23 @@ class Test(unittest.TestCase):
             for thread_k, thread_n in [(64, 256), (128, 128)]:
                 if m > 16 and thread_k == 128:
                     continue
-                self.run_problem(2 * 256, m, 1024, thread_k, thread_n)
+                for num_bits in NUM_BITS:
+                    self.run_problem(num_bits, 2 * 256, m, 1024, thread_k, thread_n)
 
     def test_k_stages_divisibility(self):
         print()
         for k in [3 * 64 + 64 * 4 * 2 + 64 * i for i in range(1, 4)]:
-            self.run_problem(2 * 256, 16, k, 64, 256)
+            for num_bits in NUM_BITS:
+                self.run_problem(num_bits, 2 * 256, 16, k, 64, 256)
 
     def test_very_few_stages(self):
         print()
         for k in [64, 128, 192]:
-            self.run_problem(3 * 256, 16, k, 64, 256)
+            for num_bits in NUM_BITS:
+                self.run_problem(num_bits, 3 * 256, 16, k, 64, 256)
 
     def test_llama_shapes(self):
         print()
-        return
         MODELS = {
             " 7B": [(4096, 3 * 4096), (4096, 4096), (4096, 2 * 10752), (10752, 4096)],
             "13B": [(5120, 3 * 5120), (5120, 5120), (5120, 2 * 13568), (13568, 5120)],
@@ -124,7 +137,10 @@ class Test(unittest.TestCase):
                 for thread_k, thread_m in [(128, 128)]:
                     for batch in [16]:
                         print(layer[1], batch, layer[0])
-                        self.run_problem(layer[1], batch, layer[0], thread_k, thread_m)
+                        for num_bits in NUM_BITS:
+                            self.run_problem(
+                                num_bits, layer[1], batch, layer[0], thread_k, thread_m
+                            )
 
     def test_groups(self):
         print()
@@ -132,7 +148,10 @@ class Test(unittest.TestCase):
             for groupsize in [128]:
                 for n, k in [(256, 512), (256, 1024), (256 * 128, 1024)]:
                     for thread_shape in [(128, 128), (64, 256)]:
-                        self.run_problem(n, m, k, *thread_shape, groupsize)
+                        for num_bits in NUM_BITS:
+                            self.run_problem(
+                                num_bits, n, m, k, *thread_shape, groupsize
+                            )
 
 
 gpu = torch.cuda.get_device_name(0)

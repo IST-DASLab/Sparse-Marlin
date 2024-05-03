@@ -29,7 +29,8 @@
 
 namespace marlin {
 
-template <const int threads,         // number of threads in a threadblock
+template <const int num_bits,        // weight bits
+          const int threads,         // number of threads in a threadblock
           const int thread_m_blocks, // number of 16x16 blocks in the m
                                      // dimension (batchsize) of the threadblock
           const int thread_n_blocks, // same for n dimension (output)
@@ -166,12 +167,16 @@ __global__ void Marlin_2_4(
       ceildiv(a_sh_stage,
               a_sh_wr_delta); // number of shared write iterations for a tile
 
-  int b_gl_stride = 16 * prob_n / 32;
-  constexpr int b_sh_stride = 32 * thread_n_blocks / 4;
+  constexpr int pack_factor = 32 / num_bits;
+
+  int b_gl_stride = 16 * prob_n / (pack_factor * 4);
+  constexpr int b_sh_stride = ((thread_n_blocks * 16) * 16 / pack_factor) / 4;
+  constexpr int b_thread_vecs = num_bits == 4 ? 1 : 2;
+  constexpr int b_sh_stride_threads = b_sh_stride / b_thread_vecs;
   int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks;
-  int b_gl_rd_delta_i = b_gl_stride * (threads / b_sh_stride);
-  constexpr int b_sh_wr_delta = threads;
-  constexpr int b_sh_rd_delta = threads;
+  int b_gl_rd_delta_i = b_gl_stride * (threads / b_sh_stride_threads);
+  constexpr int b_sh_wr_delta = threads * b_thread_vecs;
+  constexpr int b_sh_rd_delta = threads * b_thread_vecs;
   constexpr int b_sh_stage = b_sh_stride * thread_k_blocks;
   constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
 
@@ -202,12 +207,12 @@ __global__ void Marlin_2_4(
       a_sh_stride * ((threadIdx.x % 32) % 16) + (threadIdx.x % 32) / 16;
   a_sh_rd += 4 * ((threadIdx.x / 32) / (thread_n_blocks / 4));
 
-  int b_gl_rd =
-      b_gl_stride * (threadIdx.x / b_sh_stride) + (threadIdx.x % b_sh_stride);
+  int b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride_threads) +
+                (threadIdx.x % b_sh_stride_threads) * b_thread_vecs;
   b_gl_rd += b_sh_stride * slice_col;
   b_gl_rd += b_gl_rd_delta_o * slice_row;
-  int b_sh_wr = threadIdx.x;
-  int b_sh_rd = threadIdx.x;
+  int b_sh_wr = threadIdx.x * b_thread_vecs;
+  int b_sh_rd = threadIdx.x * b_thread_vecs;
 
   int m_gl_rd = m_gl_stride * (threadIdx.x / (m_sh_stride)) +
                 (threadIdx.x % (m_sh_stride));
@@ -216,8 +221,14 @@ __global__ void Marlin_2_4(
   int m_sh_wr = threadIdx.x;
   int m_sh_rd = threadIdx.x % 16 + (threadIdx.x / 32) * 16;
 
-  int s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
-                s_sh_stride * slice_col + threadIdx.x;
+  int s_gl_rd;
+  if constexpr (group_blocks == -1) {
+    s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
+  } else {
+    s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
+              s_sh_stride * slice_col + threadIdx.x;
+  }
+
   int s_sh_wr = threadIdx.x;
   int s_sh_rd;
   // We use a different scale layout for grouped and column-wise quantization as
@@ -292,7 +303,7 @@ __global__ void Marlin_2_4(
   int4 *sh_m = sh_s + (stages * s_sh_stage);
   // Register storage for double buffer of shared memory reads.
   FragA frag_a[2][thread_m_blocks][2];
-  I4 frag_b_quant[2];
+  I4 frag_b_quant[2][b_thread_vecs];
   FragM frag_m[2][2];
   FragC frag_c[thread_m_blocks][4][2];
   FragS frag_s[2][4];
@@ -319,7 +330,11 @@ __global__ void Marlin_2_4(
       int4 *sh_b_stage = sh_b + b_sh_stage * pipe;
 #pragma unroll
       for (int i = 0; i < b_sh_wr_iters; i++) {
-        cp_async4_stream(&sh_b_stage[b_sh_wr_delta * i + b_sh_wr], B_ptr[i]);
+#pragma unroll
+        for (int j = 0; j < b_thread_vecs; j++) {
+          cp_async4_stream(&sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j],
+                           B_ptr[i] + j);
+        }
         B_ptr[i] += b_gl_rd_delta_o;
       }
       int4 *sh_meta_stage = sh_m + m_sh_stage * pipe;
@@ -376,8 +391,11 @@ __global__ void Marlin_2_4(
     }
 
     int4 *sh_b_stage = sh_b + b_sh_stage * pipe;
-    frag_b_quant[k % 2] = *reinterpret_cast<I4 *>(
-        &sh_b_stage[b_sh_rd_delta * (k % b_sh_wr_iters) + b_sh_rd]);
+#pragma unroll
+    for (int i = 0; i < b_thread_vecs; i++) {
+      frag_b_quant[k % 2][i] = *reinterpret_cast<I4 *>(
+          &sh_b_stage[b_sh_rd_delta * (k % b_sh_wr_iters) + b_sh_rd + i]);
+    }
 
     // Load meta with ldsm4
     int4 *sh_m_stage = sh_m + m_sh_stage * pipe;
@@ -391,16 +409,34 @@ __global__ void Marlin_2_4(
 // dequantization and matmul operations.
 #pragma unroll
     for (int j = 0; j < 4; j++) {
-      int b_quant = frag_b_quant[k % 2][j];
-      int b_quant_shift = b_quant >> 8;
-      FragB frag_b0 = dequant(b_quant);
+      FragB frag_b0;
+      FragB frag_b1;
+
+      if constexpr (num_bits == 4) {
+        int b_quant = frag_b_quant[k % 2][0][j];
+        int b_quant_shift = b_quant >> 8;
+
+        frag_b0 = dequant_4bit(b_quant);
+        frag_b1 = dequant_4bit(b_quant_shift);
+
+      } else {
+        int *frag_b_quant_ptr = reinterpret_cast<int *>(frag_b_quant[k % 2]);
+        int b_quant_0 = frag_b_quant_ptr[j * 2 + 0];
+        int b_quant_1 = frag_b_quant_ptr[j * 2 + 1];
+
+        frag_b0 = dequant_8bit(b_quant_0);
+        frag_b1 = dequant_8bit(b_quant_1);
+      }
+
       // If there are no groups, we can just scale the final output once and can
       // avoid doing so for each weight.
-      if (group_blocks != -1)
+      if constexpr (group_blocks != -1) {
         scale(frag_b0, frag_s[k % 2][j], 0);
-      FragB frag_b1 = dequant(b_quant_shift);
-      if (group_blocks != -1)
+      }
+      if constexpr (group_blocks != -1) {
         scale(frag_b1, frag_s[k % 2][j], 1);
+      }
+
 #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
         mma_sp(frag_b0, frag_b1, frag_a[k % 2][i][0], frag_c[i][j][0],
@@ -414,13 +450,13 @@ __global__ void Marlin_2_4(
   // multiple warps that accumulate their partial sums of the same output
   // location; which we have to reduce over in the end. We do in shared memory.
   auto thread_block_reduce = [&]() {
-    constexpr int red_off = threads / b_sh_stride / 2;
+    constexpr int red_off = threads / b_sh_stride_threads / 2;
     if (red_off >= 1) {
-      int red_idx = threadIdx.x / b_sh_stride;
-      constexpr int red_sh_stride = b_sh_stride * 4 * 2;
-      constexpr int red_sh_delta = b_sh_stride;
-      int red_sh_rd = red_sh_stride * (threadIdx.x / b_sh_stride) +
-                      (threadIdx.x % b_sh_stride);
+      int red_idx = threadIdx.x / b_sh_stride_threads;
+      constexpr int red_sh_stride = b_sh_stride_threads * 4 * 2;
+      constexpr int red_sh_delta = b_sh_stride_threads;
+      int red_sh_rd = red_sh_stride * (threadIdx.x / b_sh_stride_threads) +
+                      (threadIdx.x % b_sh_stride_threads);
 
 // Parallel logarithmic shared memory reduction. We make sure to avoid any
 // unnecessary read or write iterations, e.g., for two warps we write only once
@@ -576,8 +612,9 @@ __global__ void Marlin_2_4(
       res[0] = to_half4(c0, c1, c2, c3);
       res[1] = to_half4(c4, c5, c6, c7);
       half2 *tmp = (half2 *)&res;
-      if (group_blocks ==
-          -1) { // for per-column quantization we finally apply the scale here
+      if constexpr (group_blocks == -1 &&
+                    num_bits == 4) { // for per-column quantization we finally
+                                     // apply the scale here
         tmp[0] = __hmul2(tmp[0], s0[0]);
         tmp[1] = __hmul2(tmp[1], s0[1]);
         tmp[2] = __hmul2(tmp[2], s1[0]);
@@ -672,19 +709,87 @@ __global__ void Marlin_2_4(
       bool last = slice_idx == slice_count - 1;
       // For per-column scales, we only fetch them here in the final step before
       // write-out
-      if (group_blocks == -1 && last) {
-        if (s_sh_wr_pred)
-          cp_async4_stream(&sh_s[s_sh_wr], &s[s_gl_rd]);
-        cp_async_fence();
-      }
-      thread_block_reduce();
-      if (group_blocks == -1 && last) {
-        cp_async_wait<0>();
-        __syncthreads();
-        if (threadIdx.x / 32 < thread_n_blocks / 4) {
-          *(float4 *)(frag_s) = *(float4 *)(&sh_s[s_sh_rd]);
+      if constexpr (group_blocks == -1) {
+        if constexpr (num_bits == 8) {
+          if (s_sh_wr_pred)
+            cp_async4_stream(&sh_s[s_sh_wr], &s[s_gl_rd]);
+          cp_async_fence();
+        } else {
+          if (last) {
+            if (s_sh_wr_pred)
+              cp_async4_stream(&sh_s[s_sh_wr], &s[s_gl_rd]);
+            cp_async_fence();
+          }
         }
       }
+      thread_block_reduce();
+
+      if constexpr (group_blocks == -1) {
+        if constexpr (num_bits == 8) {
+          cp_async_wait<0>();
+          __syncthreads();
+          if (threadIdx.x / 32 < thread_n_blocks / 4) {
+            *(float4 *)(frag_s) = *(float4 *)(&sh_s[s_sh_rd]);
+          }
+        } else {
+          if (last) {
+            cp_async_wait<0>();
+            __syncthreads();
+            if (threadIdx.x / 32 < thread_n_blocks / 4) {
+              *(float4 *)(frag_s) = *(float4 *)(&sh_s[s_sh_rd]);
+            }
+          }
+        }
+      }
+
+      // For 8-bit channelwise, we apply the scale before the global reduction
+      // that converts the fp32 results to fp16 (so that we avoid possible
+      // overflow in fp16)
+      if constexpr (group_blocks == -1 && num_bits == 8) {
+        auto scale_floats = [&](float *c0, float *c1, float *c2, float *c3,
+                                FragS &s0, float *c4, float *c5, float *c6,
+                                float *c7, FragS &s1) {
+          *c0 = __fmul_rn(*c0, __half2float(s0[0].x));
+          *c1 = __fmul_rn(*c1, __half2float(s0[0].y));
+          *c2 = __fmul_rn(*c2, __half2float(s0[1].x));
+          *c3 = __fmul_rn(*c3, __half2float(s0[1].y));
+
+          *c4 = __fmul_rn(*c4, __half2float(s1[0].x));
+          *c5 = __fmul_rn(*c5, __half2float(s1[0].y));
+          *c6 = __fmul_rn(*c6, __half2float(s1[1].x));
+          *c7 = __fmul_rn(*c7, __half2float(s1[1].y));
+        };
+
+        if (threadIdx.x / 32 < thread_n_blocks / 4) {
+#pragma unroll
+          for (int i = 0; i < thread_m_blocks; i++) {
+            scale_floats(&frag_c[i][0][0][0], &frag_c[i][1][0][0],
+                         &frag_c[i][2][0][0], &frag_c[i][3][0][0], frag_s[0][0],
+                         &frag_c[i][0][0][2], &frag_c[i][1][0][2],
+                         &frag_c[i][2][0][2], &frag_c[i][3][0][2],
+                         frag_s[0][2]);
+
+            scale_floats(&frag_c[i][0][0][1], &frag_c[i][1][0][1],
+                         &frag_c[i][2][0][1], &frag_c[i][3][0][1], frag_s[0][0],
+                         &frag_c[i][0][0][3], &frag_c[i][1][0][3],
+                         &frag_c[i][2][0][3], &frag_c[i][3][0][3],
+                         frag_s[0][2]);
+
+            scale_floats(&frag_c[i][0][1][0], &frag_c[i][1][1][0],
+                         &frag_c[i][2][1][0], &frag_c[i][3][1][0], frag_s[0][0],
+                         &frag_c[i][0][1][2], &frag_c[i][1][1][2],
+                         &frag_c[i][2][1][2], &frag_c[i][3][1][2],
+                         frag_s[0][2]);
+
+            scale_floats(&frag_c[i][0][1][1], &frag_c[i][1][1][1],
+                         &frag_c[i][2][1][1], &frag_c[i][3][1][1], frag_s[0][0],
+                         &frag_c[i][0][1][3], &frag_c[i][1][1][3],
+                         &frag_c[i][2][1][3], &frag_c[i][3][1][3],
+                         frag_s[0][2]);
+          }
+        }
+      }
+
       if (slice_count > 1) { // only globally reduce if there is more than one
                              // block in a slice
         barrier_acquire(&locks[slice_col], slice_idx);
@@ -724,25 +829,28 @@ __global__ void Marlin_2_4(
 
 // 8 warps are a good choice since every SM has 4 schedulers and having more
 // than 1 warp per schedule allows some more latency hiding. At the same time,
-// we want relatively few warps to have many registers per warp and small tiles.
+// we want relatively few warps to have many registers per warp and small
+// tiles.
 const int THREADS = 256;
 const int STAGES = 4; // 4 pipeline stages fit into shared memory
 const int SHARED_MEM =
     96 * 1024; // max shared memory on compute capability 8.6 (< 8.0)
 
-#define CALL_IF_2_4(THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS,         \
-                    GROUP_BLOCKS)                                              \
-  else if (thread_m_blocks == THREAD_M_BLOCKS &&                               \
+#define CALL_IF_2_4(NUM_BITS, THREAD_M_BLOCKS, THREAD_N_BLOCKS,                \
+                    THREAD_K_BLOCKS, GROUP_BLOCKS)                             \
+  else if (num_bits == NUM_BITS && thread_m_blocks == THREAD_M_BLOCKS &&       \
            thread_n_blocks == THREAD_N_BLOCKS &&                               \
            thread_k_blocks == THREAD_K_BLOCKS &&                               \
            group_blocks == GROUP_BLOCKS) {                                     \
-    cudaFuncSetAttribute(Marlin_2_4<THREADS, THREAD_N_BLOCKS, THREAD_M_BLOCKS, \
-                                    THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS>,    \
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,          \
-                         SHARED_MEM);                                          \
-    Marlin_2_4<THREADS, THREAD_N_BLOCKS, THREAD_M_BLOCKS, THREAD_K_BLOCKS,     \
-               STAGES, GROUP_BLOCKS><<<blocks, THREADS, SHARED_MEM, stream>>>( \
-        A_ptr, B_ptr, meta_ptr, C_ptr, s_ptr, prob_n, prob_m, prob_k, locks);  \
+    cudaFuncSetAttribute(                                                      \
+        Marlin_2_4<NUM_BITS, THREADS, THREAD_N_BLOCKS, THREAD_M_BLOCKS,        \
+                   THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS>,                     \
+        cudaFuncAttributeMaxDynamicSharedMemorySize, SHARED_MEM);              \
+    Marlin_2_4<NUM_BITS, THREADS, THREAD_N_BLOCKS, THREAD_M_BLOCKS,            \
+               THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS>                          \
+        <<<blocks, THREADS, SHARED_MEM, stream>>>(A_ptr, B_ptr, meta_ptr,      \
+                                                  C_ptr, s_ptr, prob_n,        \
+                                                  prob_m, prob_k, locks);      \
   }
 
 const int ERR_PROB_SHAPE = 1;
@@ -750,8 +858,8 @@ const int ERR_KERN_SHAPE = 2;
 
 int marlin_cuda_2_4(const void *A, const void *B, const void *meta, void *C,
                     void *s, int prob_m, int prob_n, int prob_k,
-                    void *workspace, int groupsize = -1, int dev = 0,
-                    cudaStream_t stream = 0, int thread_k = -1,
+                    void *workspace, int num_bits, int groupsize = -1,
+                    int dev = 0, cudaStream_t stream = 0, int thread_k = -1,
                     int thread_m = -1, int sms = -1, int max_par = 16) {
   int tot_n = prob_n;
   int tot_n_blocks = ceildiv(tot_n, 16);
@@ -762,8 +870,8 @@ int marlin_cuda_2_4(const void *A, const void *B, const void *meta, void *C,
 
   if (thread_k == -1 || thread_m == -1) {
     if (prob_n <= 16) {
-      // For small batchizes, better partioning is slightly more important than
-      // better compute utilization
+      // For small batchizes, better partioning is slightly more important
+      // than better compute utilization
       thread_k = 128;
       thread_m = 128;
     } else {
@@ -805,21 +913,34 @@ int marlin_cuda_2_4(const void *A, const void *B, const void *meta, void *C,
       thread_n_blocks = 4;
     }
 
-    // For compilation speed, we only define the kernel configurations that have
-    // seemed useful (in terms of performance) in our testing, however many more
-    // are, in principle, possible.
+    // For compilation speed, we only define the kernel configurations that
+    // have seemed useful (in terms of performance) in our testing, however
+    // many more are, in principle, possible.
     if (false) {
-    }                         //         BMxBNxBK,   group
-    CALL_IF_2_4(8, 1, 4, -1)  // e.g., 16x128x128
-    CALL_IF_2_4(8, 1, 4, 4)   // e.g., 16x128x128, 64
-    CALL_IF_2_4(16, 1, 2, -1) // e.g., 16x256x64
-    CALL_IF_2_4(16, 1, 2, 4)  // e.g., 16x256x64,  64
-    CALL_IF_2_4(16, 2, 2, -1) // e.g.. 32x256x64
-    CALL_IF_2_4(16, 2, 2, 4)
-    CALL_IF_2_4(16, 3, 2, -1)
-    CALL_IF_2_4(16, 3, 2, 4)
-    CALL_IF_2_4(16, 4, 2, -1)
-    CALL_IF_2_4(16, 4, 2, 4)
+    } //         BMxBNxBK,   group
+    // 4-bit
+    CALL_IF_2_4(4, 8, 1, 4, -1)  // e.g., 16x128x128
+    CALL_IF_2_4(4, 8, 1, 4, 4)   // e.g., 16x128x128, 64
+    CALL_IF_2_4(4, 16, 1, 2, -1) // e.g., 16x256x64
+    CALL_IF_2_4(4, 16, 1, 2, 4)  // e.g., 16x256x64,  64
+    CALL_IF_2_4(4, 16, 2, 2, -1) // e.g.. 32x256x64
+    CALL_IF_2_4(4, 16, 2, 2, 4)
+    CALL_IF_2_4(4, 16, 3, 2, -1)
+    CALL_IF_2_4(4, 16, 3, 2, 4)
+    CALL_IF_2_4(4, 16, 4, 2, -1)
+    CALL_IF_2_4(4, 16, 4, 2, 4)
+
+    // 8-bit
+    CALL_IF_2_4(8, 8, 1, 4, -1)  // e.g., 16x128x128
+    CALL_IF_2_4(8, 8, 1, 4, 4)   // e.g., 16x128x128, 64
+    CALL_IF_2_4(8, 16, 1, 2, -1) // e.g., 16x256x64
+    CALL_IF_2_4(8, 16, 1, 2, 4)  // e.g., 16x256x64,  64
+    CALL_IF_2_4(8, 16, 2, 2, -1) // e.g.. 32x256x64
+    CALL_IF_2_4(8, 16, 2, 2, 4)
+    CALL_IF_2_4(8, 16, 3, 2, -1)
+    CALL_IF_2_4(8, 16, 3, 2, 4)
+    CALL_IF_2_4(8, 16, 4, 2, -1)
+    CALL_IF_2_4(8, 16, 4, 2, 4)
     else ret = ERR_KERN_SHAPE;
 
     A_ptr += 16 * thread_n_blocks * (prob_k / 8) * par;

@@ -338,12 +338,11 @@ Marlin(const int4 *__restrict__ A, // fp16 input matrix of shape mxk
     for (int j = 0; j < 4; j++) {
       int b_quant = frag_b_quant[k % 2][j];
       int b_quant_shift = b_quant >> 8;
-      FragB frag_b0 = dequant(b_quant);
-      // If there are no groups, we can just scale the final output once and can
-      // avoid doing so for each weight.
+      FragB frag_b0 = dequant_4bit(b_quant);
+      // If there are no groups, we can just scale the final output once and can avoid doing so for each weight.
       if (group_blocks != -1)
         scale(frag_b0, frag_s[k % 2][j], 0);
-      FragB frag_b1 = dequant(b_quant_shift);
+      FragB frag_b1 = dequant_4bit(b_quant_shift);
       if (group_blocks != -1)
         scale(frag_b1, frag_s[k % 2][j], 1);
 #pragma unroll

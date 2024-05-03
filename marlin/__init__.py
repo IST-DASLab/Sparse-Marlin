@@ -42,7 +42,9 @@ from marlin._semi_structured_conversions import (
 )
 
 
-def mul_2_4(A, B, meta, C, s, workspace, thread_k=-1, thread_m=-1, sms=-1, max_par=16):
+def mul_2_4(
+    A, B, meta, C, s, workspace, num_bits, thread_k=-1, thread_m=-1, sms=-1, max_par=16
+):
     """Marlin FP16x(INT4+2:4 sparsity) multiply; can be used within `torch.compile`.
     @A: `torch.int` weight matrix of original shape `(m, k)` in Marlin format; see `Layer.pack()`
     @B: `torch.half` input matrix of shape `(n, k/2)` in column-major layout
@@ -55,7 +57,9 @@ def mul_2_4(A, B, meta, C, s, workspace, thread_k=-1, thread_m=-1, sms=-1, max_p
     @sms: number of SMs to use for the kernel (can usually be left as auto -1)
     @max_par: maximum number of batch 64 problems to solve in parallel for large input sizes
     """
-    marlin_cuda.mul_2_4(A, B, meta, C, s, workspace, thread_k, thread_m, sms, max_par)
+    marlin_cuda.mul_2_4(
+        A, B, meta, C, s, workspace, num_bits, thread_k, thread_m, sms, max_par
+    )
 
 
 def mul(A, B, C, s, workspace, thread_k=-1, thread_n=-1, sms=-1, max_par=16):
@@ -239,7 +243,7 @@ class Layer(nn.Module):
         self.s[:, :] = s.to(self.s.device)
 
 
-def _get_perms_2_4():
+def _get_perms_2_4(num_bits):
     perm = []
     for i in range(32):
         perm1 = []
@@ -256,8 +260,15 @@ def _get_perms_2_4():
         for j in range(4):
             perm.extend([p + 1 * j for p in perm1])
     perm = np.array(perm)
-    interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
-    perm = perm.reshape((-1, 8))[:, interleave].ravel()
+
+    if num_bits == 4:
+        interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
+    elif num_bits == 8:
+        interleave = np.array([0, 2, 1, 3])
+    else:
+        raise ValueError("num_bits must be 4 or 8, got {}".format(num_bits))
+
+    perm = perm.reshape((-1, len(interleave)))[:, interleave].ravel()
     perm = torch.from_numpy(perm)
     scale_perm = []
     for i in range(8):
@@ -268,7 +279,14 @@ def _get_perms_2_4():
     return perm, scale_perm, scale_perm_single
 
 
-_perm_2_4, _scale_perm_2_4, _scale_perm_single_2_4 = _get_perms_2_4()
+_perm_2_4 = {}
+_scale_perm_2_4 = {}
+_scale_perm_single_2_4 = {}
+for num_bits in [4, 8]:
+    perm_2_4, scale_perm_2_4, scale_perm_single_2_4 = _get_perms_2_4(num_bits)
+    _perm_2_4[num_bits] = perm_2_4
+    _scale_perm_2_4[num_bits] = scale_perm_2_4
+    _scale_perm_single_2_4[num_bits] = scale_perm_single_2_4
 
 
 class Layer_2_4(nn.Module):
@@ -328,23 +346,26 @@ class Layer_2_4(nn.Module):
         # mul_2_4(A, self.B, self.meta, C, self.s, self.workspace)
         return C
 
-    def pack(self, linear, scales, trans=False):
+    def pack(self, linear, scales, num_bits, trans=False):
         """Pack a fake-quantized linear layer into this actual Marlin representation.
         @linear: fake-quantized `torch.nn.Linear` layer to convert (must be of type `torch.half`)
         @scales: corresponding quantization scales of shape `(infeatures, groups)`
         """
+        assert num_bits == 4 or num_bits == 8
+        pack_factor = 32 // num_bits
+
         if linear.weight.dtype != torch.half:
             raise ValueError("Only `torch.half` weights are supported.")
         if trans:
             perm, scale_perm, scale_perm_single = (
-                _perm_2_4,
-                _scale_perm_2_4,
-                _scale_perm_single_2_4,
+                _perm_2_4[num_bits],
+                _scale_perm_2_4[num_bits],
+                _scale_perm_single_2_4[num_bits],
             )
         else:
             perm, scale_perm, scale_perm_single = _perm, _scale_perm, _scale_perm_single
         tile = 16
-        maxq = 2**4 - 1
+        maxq = (1 << num_bits) - 1
         s = scales
         w = linear.weight.data
         if self.groupsize != self.k:
@@ -377,10 +398,10 @@ class Layer_2_4(nn.Module):
         w = w.reshape((self.k // tile, self.n * tile))
         res = w
         res = res.reshape((-1, perm.numel()))[:, perm].reshape(res.shape)
-        q = np.zeros((res.shape[0], res.shape[1] // 8), dtype=np.uint32)
+        q = np.zeros((res.shape[0], res.shape[1] // pack_factor), dtype=np.uint32)
         res = res.cpu().numpy().astype(np.uint32)
-        for i in range(8):
-            q |= res[:, i::8] << 4 * i
+        for i in range(pack_factor):
+            q |= res[:, i::pack_factor] << num_bits * i
 
         q = torch.from_numpy(q.astype(np.int32)).to(w.device)
         self.B[:, :] = q.to(self.B.device)

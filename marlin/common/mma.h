@@ -123,11 +123,22 @@ __device__ __forceinline__ uint2 to_half4(float c0, float c1, float c2,
   return r;
 }
 
+// Constructs destination register by taking bytes from 2 sources (based on
+// mask)
+template <int start_byte, int mask>
+__device__ inline uint32_t prmt(uint32_t a) {
+  uint32_t res;
+  asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+               : "=r"(res)
+               : "r"(a), "n"(start_byte), "n"(mask));
+  return res;
+}
+
 // Efficiently dequantize an int32 value into a full B-fragment of 4 fp16
 // values. We mostly follow the strategy in the link below, with some small
 // changes:
 // https://github.com/NVIDIA/FasterTransformer/blob/main/src/fastertransformer/cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h
-__device__ inline FragB dequant(int q) {
+__device__ inline FragB dequant_4bit(int q) {
   const int LO = 0x000f000f;
   const int HI = 0x00f000f0;
   const int EX = 0x64006400;
@@ -146,6 +157,24 @@ __device__ inline FragB dequant(int q) {
   frag_b[1] = __hfma2(*reinterpret_cast<half2 *>(&hi),
                       *reinterpret_cast<const half2 *>(&MUL),
                       *reinterpret_cast<const half2 *>(&ADD));
+  return frag_b;
+}
+
+__device__ inline FragB dequant_8bit(int q) {
+  static constexpr uint32_t mask_for_elt_01 = 0x5250;
+  static constexpr uint32_t mask_for_elt_23 = 0x5351;
+  static constexpr uint32_t start_byte_for_fp16 = 0x64646464;
+
+  uint32_t lo = prmt<start_byte_for_fp16, mask_for_elt_01>(q);
+  uint32_t hi = prmt<start_byte_for_fp16, mask_for_elt_23>(q);
+
+  static constexpr uint32_t I8s_TO_F16s_MAGIC_NUM = 0x64806480;
+
+  FragB frag_b;
+  frag_b[0] = __hsub2(*reinterpret_cast<half2 *>(&lo),
+                      *reinterpret_cast<const half2 *>(&I8s_TO_F16s_MAGIC_NUM));
+  frag_b[1] = __hsub2(*reinterpret_cast<half2 *>(&hi),
+                      *reinterpret_cast<const half2 *>(&I8s_TO_F16s_MAGIC_NUM));
   return frag_b;
 }
 
