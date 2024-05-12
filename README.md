@@ -3,7 +3,7 @@
 </div>
 
 # Sparse-Marlin
-This is Sparse-Marlin, an extension of the [**M**ixed **A**uto-**R**egressive **Lin**ear](https://github.com/IST-DASLab/marlin/tree/master) dense kernel for 4-bit quantized weights, now with support for 2:4 sparsity.
+This is Sparse-Marlin, an extension of the [**M**ixed **A**uto-**R**egressive **Lin**ear (Marlin)](https://github.com/IST-DASLab/marlin/tree/master) dense kernel for 4-bit quantized weights, now with support for 2:4 sparsity.
 Sparse-Marlin is an extremely optimized GPU kernel performing a matrix multiply and accumulate operation, ```C=AxB```, where ```A``` and ```C``` are FP16 matrices, and ```B``` is a 50% sparse matrix following the 2:4 format, whose values are quantized and stored in INT4 precision.
 Integrating a 2:4 sparsity scheme on top of the existing 4-bit quantized weight representation offers a promising opportunity to further enhance the FLOPS/Byte ratio, and push the baseline performance further.
 Sparse-Marlin boosts the close-to-ideal performance of dense Marlin, and provides near-optimal speedups of around 5.3x, while being more robust to larger batch sizes.
