@@ -295,7 +295,7 @@ class Layer_2_4(nn.Module):
         self.n = outfeatures
         self.groupsize = groupsize
         self.register_buffer(
-            "B", torch.empty((self.k // 16, self.n * 16 // 8), dtype=torch.int)
+            "B", torch.empty((self.k // 16 // 2, self.n * 16 // 8), dtype=torch.int)
         )
         self.register_buffer(
             "meta", torch.empty((self.n, self.k // 16), dtype=torch.int16)
@@ -365,8 +365,15 @@ class Layer_2_4(nn.Module):
             s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
 
         mask = mask_creator(w.T).cuda().bool()
+        # Avoid confusing the pruned elements and the zero elements (-8 + (maxq + 1) // 2)
+        w += 1
+
         w = mask * w.T
         w, meta = sparse_semi_structured_from_dense_cutlass(w)
+        
+        # Reover the original values
+        w -= 1
+        
         w = w.t()
         self.k = self.k // 2
         self.groupsize = self.groupsize // 2
