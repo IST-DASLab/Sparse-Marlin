@@ -304,6 +304,11 @@ def mask_creator(tensor):
 
     num_groups = tensor.numel() // M
 
+    # Subtract the offset value for pruning
+    maxq = 2**4 - 1
+    ZERO_VALUE = (maxq + 1) // 2
+    tensor = tensor - ZERO_VALUE
+
     # N:M sparsity for linear layers
     tensor_temp = tensor.detach().abs().reshape(num_groups, M)
     index = torch.argsort(tensor_temp, dim=1)[:, : int(M - N)]
